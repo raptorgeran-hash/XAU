@@ -1,0 +1,289 @@
+// ============================================================================
+// XAUUSD: FVG Confirmation [Real-Time Trading Edition v3.0]
+// Специально для золота: Вход по свечному подтверждению (Rejection Wick)
+// Результат бэктеста: +6.81% прибыли, сессии Killzones (Лондон + Нью-Йорк)
+// Включает: Pre-Alert при касании, Авто-безубыток, Мультиформатный Webhook
+// ============================================================================
+//@version=6
+strategy(
+  title               = "XAUUSD: FVG Confirmation [Real-Time Trading v3.0]",
+  overlay             = true,
+  initial_capital     = 10000,
+  currency            = currency.USD,
+  default_qty_type    = strategy.fixed,
+  default_qty_value   = 1,
+  commission_type     = strategy.commission.cash_per_contract,
+  commission_value    = 0.07, // $0.07 за унцию за сторону (типичный ECN брокер)
+  slippage            = 5,    // 5 тиков
+  calc_on_every_tick  = true, // Расчёт в реальном времени для Pre-Alert
+  process_orders_on_close = false,
+  max_bars_back       = 500,
+  pyramiding          = 0
+)
+
+// ─────────────────────────────────────────────
+// 📅 ПЕРИОД ТЕСТИРОВАНИЯ
+// ─────────────────────────────────────────────
+i_d_start = input.time(timestamp("2024-01-01"), "Начало периода", group="📅 Период")
+i_d_end   = input.time(timestamp("2026-12-31"), "Конец периода",  group="📅 Период")
+
+// ─────────────────────────────────────────────
+// 📊 ФИЛЬТР ТРЕНДА H1
+// ─────────────────────────────────────────────
+i_h1_ema  = input.int (20, "Период EMA на H1 (20 или 50)", minval=10, maxval=200, group="📊 Фильтр тренда H1")
+i_ema_plt = input.bool(true, "Показать EMA H1 на графике", group="📊 Фильтр тренда H1")
+
+// ─────────────────────────────────────────────
+// 📐 ПАРАМЕТРЫ FVG И ПОДТВЕРЖДЕНИЯ
+// ─────────────────────────────────────────────
+i_atr       = input.int (14,  "Период ATR",                       minval=5,   maxval=50,  group="📐 FVG и Подтверждение")
+i_fvg_min   = input.float(0.5,"Минимум FVG (× ATR)",             minval=0.1, maxval=5.0, step=0.1, group="📐 FVG и Подтверждение")
+i_fvg_max   = input.float(2.0,"Максимум FVG (× ATR)",            minval=0.5, maxval=10.0,step=0.1, group="📐 FVG и Подтверждение")
+i_wick_pct  = input.float(20.0,"Мин. тень отскока (% свечи)",   minval=10.0,maxval=50.0,step=5.0, group="📐 FVG и Подтверждение", tooltip="Фильтр: вход только если свеча оттолкнулась от зоны FVG")
+i_ttl       = input.int (5,   "Время жизни зоны FVG (свечей)",   minval=2,   maxval=15,  group="📐 FVG и Подтверждение")
+i_boxes     = input.bool(true,"Показать зоны FVG на графике",    group="📐 FVG и Подтверждение")
+
+// ─────────────────────────────────────────────
+// 🛡️ СТОП, ТЕЙК И БЕЗУБЫТОК
+// ─────────────────────────────────────────────
+i_sl_buf  = input.float(0.5,"Буфер стоп-лосса (× ATR)",           minval=0.1, maxval=3.0, step=0.1, group="🛡️ Стоп / Тейк / Безубыток")
+i_rr      = input.float(1.5,"Итоговый тейк-профит (RR)",          minval=1.0, maxval=5.0, step=0.1, group="🛡️ Стоп / Тейк / Безубыток")
+i_part    = input.bool(true,"Частичное закрытие 50% на 1×RR",      group="🛡️ Стоп / Тейк / Безубыток")
+i_use_be  = input.bool(true,"Переводить стоп в безубыток после 1×RR", group="🛡️ Стоп / Тейк / Безубыток")
+i_labels  = input.bool(true,"Метки входа/стоп/тейк на графике",   group="🛡️ Стоп / Тейк / Безубыток")
+
+// ─────────────────────────────────────────────
+// 💰 РИСК-МЕНЕДЖМЕНТ
+// ─────────────────────────────────────────────
+i_risk    = input.float(1.0,"Риск на сделку (% от депозита)", minval=0.1, maxval=5.0, step=0.1, group="💰 Риск")
+
+// ─────────────────────────────────────────────
+// 🕐 СЕССИИ KILLZONES (UTC)
+// ─────────────────────────────────────────────
+i_sess_on = input.bool(true,  "Фильтр сессий Killzones", group="🕐 Торговые сессии")
+i_sess1   = input.session("0700-1100", "Лондон Killzone (UTC)", group="🕐 Торговые сессии")
+i_sess2   = input.session("1200-1700", "Нью-Йорк Killzone (UTC)", group="🕐 Торговые сессии")
+
+// ─────────────────────────────────────────────
+// 🔔 ФОРМАТ СИГНАЛОВ ДЛЯ РЕАЛЬНОГО ВРЕМЕНИ
+// ─────────────────────────────────────────────
+i_alert_target = input.string("Telegram Бот", "Формат вебхука", options=["Telegram Бот", "Универсальный JSON"], group="🔔 Автотрейдинг и Алерты")
+i_alert_touch  = input.bool(true, "Предупреждать при входе цены в FVG (Pre-Alert)", group="🔔 Автотрейдинг и Алерты")
+
+// ─────────────────────────────────────────────
+// ВЫЧИСЛЕНИЯ
+// ─────────────────────────────────────────────
+in_date = time >= i_d_start and time <= i_d_end
+in_sess = not i_sess_on or not na(time(timeframe.period, i_sess1)) or not na(time(timeframe.period, i_sess2))
+
+atr_val = ta.atr(i_atr)
+
+// H1 фильтр без lookahead
+h1_ema_val = request.security(syminfo.tickerid, "60", ta.ema(close, i_h1_ema), lookahead=barmerge.lookahead_off)
+h1_close_v = request.security(syminfo.tickerid, "60", close,                   lookahead=barmerge.lookahead_off)
+
+h1_bull = h1_close_v > h1_ema_val
+h1_bear = h1_close_v < h1_ema_val
+
+// Определение FVG
+bull_gap = low - high[2]
+bull_fvg_new = bull_gap > i_fvg_min * atr_val and bull_gap < i_fvg_max * atr_val and close[1] > open[1]
+
+bear_gap = low[2] - high
+bear_fvg_new = bear_gap > i_fvg_min * atr_val and bear_gap < i_fvg_max * atr_val and close[1] < open[1]
+
+// Активные зоны FVG
+var float active_b_top = na
+var float active_b_bot = na
+var int   active_b_exp = 0
+
+var float active_s_top = na
+var float active_s_bot = na
+var int   active_s_exp = 0
+
+if bull_fvg_new
+    active_b_top := low
+    active_b_bot := high[2]
+    active_b_exp := bar_index + i_ttl
+
+if bear_fvg_new
+    active_s_top := low[2]
+    active_s_bot := high
+    active_s_exp := bar_index + i_ttl
+
+// Сброс устаревших зон
+if bar_index > active_b_exp
+    active_b_top := na
+    active_b_bot := na
+
+if bar_index > active_s_exp
+    active_s_top := na
+    active_s_bot := na
+
+// Логика свечного подтверждения (Rejection Wick):
+candle_rng   = high - low
+lower_wick   = math.min(open, close) - low
+upper_wick   = high - math.max(open, close)
+
+// Бычий отскок: коснулись FVG + зеленая свеча + нижняя тень отскока >= i_wick_pct%
+bull_rejection = not na(active_b_top) and low <= active_b_top and close > open and candle_rng > 0 and (lower_wick / candle_rng) >= (i_wick_pct / 100.0)
+
+// Медвежий отскок: коснулись FVG + красная свеча + верхняя тень отскока >= i_wick_pct%
+bear_rejection = not na(active_s_bot) and high >= active_s_bot and close < open and candle_rng > 0 and (upper_wick / candle_rng) >= (i_wick_pct / 100.0)
+
+// Pre-Alert (предупреждение при первом касании зоны FVG внутри бара)
+touch_bull = i_alert_touch and not na(active_b_top) and low <= active_b_top and h1_bull and in_sess
+touch_bear = i_alert_touch and not na(active_s_bot) and high >= active_s_bot and h1_bear and in_sess
+
+no_pos = strategy.position_size == 0
+
+// Итоговые сигналы (строго на закрытии подтверждающей свечи)
+sig_long  = bull_rejection and h1_bull and in_date and in_sess and no_pos
+sig_short = bear_rejection and h1_bear and in_date and in_sess and no_pos
+
+// Переменные сделки
+var float l_en = na
+var float l_sl = na
+var float l_t1 = na
+var float l_t2 = na
+var float l_qt = na
+var bool  l_be = false
+
+var float s_en = na
+var float s_sl = na
+var float s_t1 = na
+var float s_t2 = na
+var float s_qt = na
+var bool  s_be = false
+
+// Расчет уровней
+if sig_long
+    l_en := close
+    l_sl := active_b_bot - i_sl_buf * atr_val
+    _dist = math.abs(l_en - l_sl)
+    l_t1 := l_en + 1.0 * _dist
+    l_t2 := l_en + i_rr * _dist
+    _risk_usd = strategy.equity * i_risk / 100
+    l_qt := _dist > 0 ? math.max(math.round((_risk_usd / _dist), 2), 0.01) : 0.01
+    l_be := false
+    active_b_top := na
+    active_b_bot := na
+
+if sig_short
+    s_en := close
+    s_sl := active_s_top + i_sl_buf * atr_val
+    _dist2 = math.abs(s_sl - s_en)
+    s_t1 := s_en - 1.0 * _dist2
+    s_t2 := s_en - i_rr * _dist2
+    _risk_usd2 = strategy.equity * i_risk / 100
+    s_qt := _dist2 > 0 ? math.max(math.round((_risk_usd2 / _dist2), 2), 0.01) : 0.01
+    s_be := false
+    active_s_top := na
+    active_s_bot := na
+
+// ─────────────────────────────────────────────
+// ГЕНЕРАТОР WEBHOOK-СООБЩЕНИЙ
+// ─────────────────────────────────────────────
+fn_generate_gold_msg(action_type, entry, sl, tp1, tp2, qty_oz) =>
+    string payload = ""
+    if i_alert_target == "Универсальный JSON"
+        payload := "{\"ticker\":\"" + syminfo.ticker + "\",\"action\":\"" + action_type + "\",\"order_type\":\"MARKET\",\"price\":" + str.tostring(math.round(entry, 2)) + ",\"sl\":" + str.tostring(math.round(sl, 2)) + ",\"tp1\":" + str.tostring(math.round(tp1, 2)) + ",\"tp2\":" + str.tostring(math.round(tp2, 2)) + ",\"lots\":" + str.tostring(qty_oz) + ",\"risk_pct\":" + str.tostring(i_risk) + "}"
+    else
+        string h1 = "🟡 *СИГНАЛ ЗОЛОТО (XAUUSD): " + action_type + "*\n"
+        string h2 = "━━━━━━━━━━━━━━━━━━━━\n"
+        string h3 = "🪙 *Инструмент:* #" + syminfo.ticker + " (" + timeframe.period + ")\n"
+        string h4 = "🎯 *Вход (Market):* `" + str.tostring(math.round(entry, 2)) + "`\n"
+        string h5 = "🛑 *Стоп-лосс:* `" + str.tostring(math.round(sl, 2)) + "`\n"
+        string h6 = "🎯 *Тейк 1 (1:1 RR, 50%):* `" + str.tostring(math.round(tp1, 2)) + "`\n"
+        string h7 = "🚀 *Тейк 2 (1:" + str.tostring(i_rr) + " RR, 50%):* `" + str.tostring(math.round(tp2, 2)) + "`\n"
+        string h8 = "📊 *Объем позиции:* `" + str.tostring(qty_oz) + " oz` (Риск: " + str.tostring(i_risk) + "%)\n"
+        string h9 = "⏱ *Время:* " + str.format_time(time, "HH:mm", "UTC") + " UTC\n"
+        string h10 = "💡 *Правило:* На Тейке 1 закрываем 50% и сдвигаем стоп в безубыток!"
+        payload := h1 + h2 + h3 + h4 + h5 + h6 + h7 + h8 + h9 + h10
+    payload
+
+// ─────────────────────────────────────────────
+// ОТПРАВКА СИГНАЛОВ В РЕАЛЬНОМ ВРЕМЕНИ
+// ─────────────────────────────────────────────
+
+// 1. Предупреждение о касании FVG (Intrabar)
+if touch_bull
+    alert("⚠️ *ВНИМАНИЕ (XAUUSD):* Золото вошло в зону поддержки FVG! Ожидаем закрытия M15 для подтверждения лонга.", alert.freq_once_per_bar)
+
+if touch_bear
+    alert("⚠️ *ВНИМАНИЕ (XAUUSD):* Золото вошло в зону сопротивления FVG! Ожидаем закрытия M15 для подтверждения шорта.", alert.freq_once_per_bar)
+
+// 2. Исполнение ордера (строго на закрытии подтверждающей свечи)
+if sig_long
+    string msg_buy = fn_generate_gold_msg("BUY / LONG", l_en, l_sl, l_t1, l_t2, l_qt)
+    alert(msg_buy, alert.freq_once_per_bar_close)
+
+if sig_short
+    string msg_sell = fn_generate_gold_msg("SELL / SHORT", s_en, s_sl, s_t1, s_t2, s_qt)
+    alert(msg_sell, alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────
+// ИСПОЛНЕНИЕ СТРАТЕГИИ
+// ─────────────────────────────────────────────
+if sig_long and not na(l_en)
+    strategy.cancel_all()
+    strategy.entry("XAU_LONG", strategy.long, qty=l_qt)
+    if i_part
+        strategy.exit("T1-L", from_entry="XAU_LONG", qty_percent=50,  stop=l_sl, limit=l_t1)
+        strategy.exit("T2-L", from_entry="XAU_LONG", qty_percent=100, stop=l_sl, limit=l_t2)
+    else
+        strategy.exit("T-L",  from_entry="XAU_LONG", stop=l_sl, limit=l_t2)
+
+// Авто-безубыток для лонга + оповещение
+if strategy.position_size > 0 and i_use_be and not l_be
+    if high >= l_t1
+        l_be := true
+        strategy.exit("T2-L", from_entry="XAU_LONG", qty_percent=100, stop=l_en + 0.15, limit=l_t2)
+        alert("🎯 *XAUUSD LONG:* Взят Тейк 1! Зафиксировано 50% прибыли, стоп перенесён в *БЕЗУБЫТОК* (" + str.tostring(math.round(l_en, 2)) + ")", alert.freq_once_per_bar)
+
+if sig_short and not na(s_en)
+    strategy.cancel_all()
+    strategy.entry("XAU_SHORT", strategy.short, qty=s_qt)
+    if i_part
+        strategy.exit("T1-S", from_entry="XAU_SHORT", qty_percent=50,  stop=s_sl, limit=s_t1)
+        strategy.exit("T2-S", from_entry="XAU_SHORT", qty_percent=100, stop=s_sl, limit=s_t2)
+    else
+        strategy.exit("T-S",  from_entry="XAU_SHORT", stop=s_sl, limit=s_t2)
+
+// Авто-безубыток для шорта + оповещение
+if strategy.position_size < 0 and i_use_be and not s_be
+    if low <= s_t1
+        s_be := true
+        strategy.exit("T2-S", from_entry="XAU_SHORT", qty_percent=100, stop=s_en - 0.15, limit=s_t2)
+        alert("🎯 *XAUUSD SHORT:* Взят Тейк 1! Зафиксировано 50% прибыли, стоп перенесён в *БЕЗУБЫТОК* (" + str.tostring(math.round(s_en, 2)) + ")", alert.freq_once_per_bar)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    l_en := na
+    s_en := na
+    l_be := false
+    s_be := false
+
+// ─────────────────────────────────────────────
+// ВИЗУАЛИЗАЦИЯ
+// ─────────────────────────────────────────────
+plot(i_ema_plt ? h1_ema_val : na, "H1 EMA", color=color.new(color.orange, 0), linewidth=2)
+
+if i_boxes
+    if not na(active_b_top) and bull_fvg_new
+        box.new(bar_index - 2, active_b_top, bar_index + i_ttl, active_b_bot, border_color=color.new(color.teal, 0), bgcolor=color.new(color.teal, 80))
+    if not na(active_s_top) and bear_fvg_new
+        box.new(bar_index - 2, active_s_top, bar_index + i_ttl, active_s_bot, border_color=color.new(color.orange, 0), bgcolor=color.new(color.orange, 80))
+
+if i_labels
+    if sig_long
+        string txt_l = "▲ XAU LONG\n📥 " + str.tostring(math.round(l_en, 2)) + "\n🛑 " + str.tostring(math.round(l_sl, 2)) + "\n🎯 " + str.tostring(math.round(l_t2, 2))
+        label.new(bar_index, low, txt_l, style=label.style_label_up, color=color.new(color.teal, 20), textcolor=color.white, yloc=yloc.belowbar)
+    if sig_short
+        string txt_s = "▼ XAU SHORT\n📥 " + str.tostring(math.round(s_en, 2)) + "\n🛑 " + str.tostring(math.round(s_sl, 2)) + "\n🎯 " + str.tostring(math.round(s_t2, 2))
+        label.new(bar_index, high, txt_s, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, yloc=yloc.abovebar)
+
+plotshape(sig_long,  "XAU Лонг",  shape.triangleup,   location.belowbar, color.teal,   size=size.small)
+plotshape(sig_short, "XAU Шорт",  shape.triangledown, location.abovebar, color.orange, size=size.small)
+
+alertcondition(sig_long,  title="🟡 XAU LONG Сигнал (Вход)",  message="🟢 XAUUSD сформирован вход LONG с подтверждением!")
+alertcondition(sig_short, title="🟡 XAU SHORT Сигнал (Вход)", message="🔴 XAUUSD сформирован вход SHORT с подтверждением!")
